@@ -27,6 +27,7 @@ from openpyxl.styles import Font, PatternFill
 
 URLS_FILE = "urls.txt"
 INCIDENTS_FILE = "data/incidents_week.csv"
+THREAD_ID_FILE = "data/thread_id.txt"
 DOMAIN = "www.cabinezero15.com.br"
 TIMEOUT = 15
 
@@ -167,6 +168,12 @@ def reset_incidents_file():
         writer.writeheader()
 
 
+def reset_thread_id():
+    """Reinicia a conversa de e-mail dos alertas — cada semana começa um thread novo."""
+    if os.path.exists(THREAD_ID_FILE):
+        os.remove(THREAD_ID_FILE)
+
+
 def main():
     with open(URLS_FILE, encoding="utf-8") as f:
         urls = [line.strip() for line in f if line.strip()]
@@ -188,6 +195,9 @@ def main():
 
     print("Zerando o arquivo de incidentes da semana...")
     reset_incidents_file()
+
+    print("Reiniciando o thread de e-mail dos alertas para a nova semana...")
+    reset_thread_id()
 
     print("Concluído.")
 
