@@ -10,10 +10,17 @@ O que faz em cada execução:
 3. Mede o tempo de resposta de cada página.
 4. Se algo falhar, tenta de novo (confirmação dupla) antes de considerar
    incidente de verdade — evita alarme falso por instabilidade passageira.
-5. Se confirmar um incidente novo, registra em data/incidents_week.csv
-   e manda alerta instantâneo pro WhatsApp via CallMeBot.
-6. Se um incidente que estava aberto foi resolvido, marca a resolução
-   no mesmo arquivo e avisa que voltou ao normal.
+5. Se confirmar incidentes novos, registra em data/incidents_week.csv e
+   manda UM ÚNICO alerta (WhatsApp + e-mail) com a lista de todas as
+   falhas confirmadas nesta execução — nunca um alerta por URL.
+6. Se incidentes que estavam abertos foram resolvidos, marca a resolução
+   no mesmo arquivo e manda UM ÚNICO alerta com a lista de tudo que
+   voltou ao normal nesta execução.
+
+Os e-mails de alerta usam sempre o mesmo assunto fixo e são encadeados
+via cabeçalhos Message-ID / In-Reply-To / References, então o Gmail
+agrupa tudo numa única conversa (o "thread" é reiniciado toda semana,
+junto com o reset do incidents_week.csv, pelo weekly_report.py).
 
 O arquivo data/incidents_week.csv é zerado semanalmente pelo weekly_report.py
 depois de compilar e enviar o relatório — não vira um histórico permanente.
@@ -25,12 +32,14 @@ import smtplib
 import sys
 import time
 import datetime
+import email.utils
 import urllib.request
 import urllib.error
 from email.message import EmailMessage
 
 URLS_FILE = "urls.txt"
 INCIDENTS_FILE = "data/incidents_week.csv"
+THREAD_ID_FILE = "data/thread_id.txt"
 TIMEOUT = 15
 RETRY_WAIT_SECONDS = 20
 CTA_PATTERN = re.compile(r'href="(https://www\.cabinezero15\.com\.br/solicitar-orcamento\.html)"')
@@ -40,6 +49,10 @@ CALLMEBOT_APIKEY = os.environ.get("CALLMEBOT_APIKEY", "")
 EMAIL_FROM = os.environ.get("EMAIL_FROM", "")
 EMAIL_APP_PASSWORD = os.environ.get("EMAIL_APP_PASSWORD", "")
 EMAIL_TO = os.environ.get("EMAIL_TO", "")
+
+# Assunto fixo (sem data/hora) — ajuda o Gmail a agrupar por thread mesmo
+# quando os cabeçalhos de referência não bastam sozinhos.
+SUBJECT_ALERTA = "Cabine Zero 15 — monitoramento de links"
 
 
 def fetch(url):
@@ -111,6 +124,29 @@ def send_whatsapp(message):
         print(f"[aviso] Falha ao enviar WhatsApp: {e}")
 
 
+def get_thread_headers():
+    """
+    Garante que todos os e-mails de alerta da semana fiquem na mesma
+    conversa do Gmail. Retorna (message_id_deste_email, in_reply_to, references).
+    Na primeira chamada da semana (arquivo ainda não existe), este e-mail
+    VIRA a raiz da conversa — os próximos referenciam ele.
+    """
+    os.makedirs("data", exist_ok=True)
+    root_id = ""
+    if os.path.exists(THREAD_ID_FILE):
+        with open(THREAD_ID_FILE, encoding="utf-8") as f:
+            root_id = f.read().strip()
+
+    if root_id:
+        new_id = email.utils.make_msgid(domain="cabinezero15.com.br")
+        return new_id, root_id, root_id
+    else:
+        new_id = email.utils.make_msgid(domain="cabinezero15.com.br")
+        with open(THREAD_ID_FILE, "w", encoding="utf-8") as f:
+            f.write(new_id)
+        return new_id, None, None
+
+
 def send_email_alert(subject, message):
     if not EMAIL_FROM or not EMAIL_APP_PASSWORD or not EMAIL_TO:
         print("[aviso] Variáveis de e-mail não configuradas — não foi possível alertar por e-mail.")
@@ -120,6 +156,13 @@ def send_email_alert(subject, message):
         msg["Subject"] = subject
         msg["From"] = EMAIL_FROM
         msg["To"] = EMAIL_TO
+
+        msg_id, in_reply_to, references = get_thread_headers()
+        msg["Message-ID"] = msg_id
+        if in_reply_to:
+            msg["In-Reply-To"] = in_reply_to
+            msg["References"] = references
+
         msg.set_content(message)
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
             smtp.login(EMAIL_FROM, EMAIL_APP_PASSWORD)
@@ -128,10 +171,10 @@ def send_email_alert(subject, message):
         print(f"[aviso] Falha ao enviar e-mail de alerta: {e}")
 
 
-def notify(subject, message):
-    """Manda por todos os canais configurados — WhatsApp e e-mail."""
-    send_whatsapp(message)
-    send_email_alert(subject, message)
+def notify_batch(subject, whatsapp_text, email_text):
+    """Manda UM alerta (WhatsApp + e-mail) cobrindo vários itens de uma vez."""
+    send_whatsapp(whatsapp_text)
+    send_email_alert(subject, email_text)
 
 
 def rewrite_incidents(all_rows):
@@ -180,25 +223,44 @@ def main():
 
     urls_already_open = {row["url"] for row in all_rows if row.get("resolved_at", "") == ""}
 
-    # Fecha incidentes que voltaram ao normal
+    # --- Junta tudo que foi resolvido nesta execução (não notifica ainda) ---
+    newly_resolved = []
     for row in all_rows:
         if row.get("resolved_at", "") == "" and row["url"] not in confirmed_broken:
             row["resolved_at"] = now
-            notify(
-                "✅ Cabine Zero 15 — resolvido",
-                f"{row['url']}\nVoltou a funcionar normalmente.\nHorário: {now}",
-            )
+            newly_resolved.append(row["url"])
 
-    # Abre incidentes novos (não alerta de novo se já estava aberto)
+    # --- Junta tudo que é incidente novo nesta execução (não notifica ainda) ---
+    newly_broken = []
     for url, reason in confirmed_broken.items():
         if url not in urls_already_open:
             all_rows.append({"url": url, "reason": reason, "opened_at": now, "resolved_at": ""})
-            notify(
-                "🚨 Cabine Zero 15 — problema detectado",
-                f"{url}\nMotivo: {reason}\nDetectado em: {now}",
-            )
+            newly_broken.append((url, reason))
 
     rewrite_incidents(all_rows)
+
+    # --- Um único alerta por execução, juntando falhas E resoluções ---
+    if newly_broken or newly_resolved:
+        blocos_whatsapp = []
+        blocos_email = []
+
+        if newly_broken:
+            linhas = [f"• {u}\n  Motivo: {motivo}" for u, motivo in newly_broken]
+            blocos_whatsapp.append(f"🚨 {len(newly_broken)} problema(s) detectado(s):\n\n" + "\n\n".join(linhas))
+            blocos_email.append(
+                f"PROBLEMAS DETECTADOS ({len(newly_broken)})\n" + "\n\n".join(linhas)
+            )
+
+        if newly_resolved:
+            linhas = [f"• {u}" for u in newly_resolved]
+            blocos_whatsapp.append(f"✅ {len(newly_resolved)} página(s) voltaram ao normal:\n\n" + "\n".join(linhas))
+            blocos_email.append(
+                f"RESOLVIDOS ({len(newly_resolved)})\n" + "\n".join(linhas)
+            )
+
+        whatsapp_text = f"Cabine Zero 15 — {now}\n\n" + "\n\n---\n\n".join(blocos_whatsapp)
+        email_text = f"Horário da verificação: {now}\n\n" + "\n\n---\n\n".join(blocos_email)
+        notify_batch(SUBJECT_ALERTA, whatsapp_text, email_text)
 
     total_broken_now = len(confirmed_broken)
     print(f"\nResumo: {len(urls) - total_broken_now}/{len(urls)} páginas OK.")
