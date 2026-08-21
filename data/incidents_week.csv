@@ -665,3 +665,4 @@ https://www.cabinezero15.com.br/servicos/espelho-magico.html,falha de conexão: 
 https://www.cabinezero15.com.br/servicos/eventos-corporativos.html,falha de conexão: <urlopen error [Errno 101] Network is unreachable>,2026-08-20T23:32:57,2026-08-21T03:03:19
 https://www.cabinezero15.com.br/sobre.html,falha de conexão: <urlopen error [Errno 101] Network is unreachable>,2026-08-20T23:32:57,2026-08-21T03:03:19
 https://www.cabinezero15.com.br/solicitar-orcamento.html,falha de conexão: <urlopen error [Errno 101] Network is unreachable>,2026-08-20T23:32:57,2026-08-21T03:03:19
+https://www.cabinezero15.com.br/sobre.html,"página OK, mas o link do botão de orçamento está quebrado (The read operation timed out)",2026-08-21T04:01:14,
