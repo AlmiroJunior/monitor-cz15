@@ -175,8 +175,8 @@ def reset_thread_id():
 
 
 def main():
-    with open(URLS_FILE, encoding="utf-8") as f:
-        urls = [line.strip() for line in f if line.strip()]
+    from check_links import load_urls
+    urls, _ = load_urls()
 
     print("Verificando certificado SSL...")
     ssl_days, ssl_expire_str = check_ssl_days_left(DOMAIN)

@@ -35,9 +35,11 @@ import datetime
 import email.utils
 import urllib.request
 import urllib.error
+import xml.etree.ElementTree as ET
 from email.message import EmailMessage
 
 URLS_FILE = "urls.txt"
+SITEMAP_URL = "https://www.cabinezero15.com.br/sitemap.xml"
 INCIDENTS_FILE = "data/incidents_week.csv"
 THREAD_ID_FILE = "data/thread_id.txt"
 TIMEOUT = 15
@@ -70,6 +72,42 @@ def fetch(url):
     except Exception as e:
         elapsed_ms = round((time.time() - start) * 1000)
         return None, elapsed_ms, None, str(e)
+
+
+def fetch_sitemap_urls():
+    """
+    Lê as páginas publicadas no sitemap.xml do site (só <loc> de página,
+    ignora <image:loc>). Retorna um set vazio se o sitemap não puder ser lido
+    — nesse caso o monitor segue só com o urls.txt, sem quebrar.
+    """
+    try:
+        req = urllib.request.Request(SITEMAP_URL, headers={"User-Agent": "CabineZero15-LinkMonitor/2.0"})
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+            root = ET.fromstring(resp.read())
+        ns = "{http://www.sitemaps.org/schemas/sitemap/0.9}"
+        found = {el.text.strip() for el in root.iter(ns + "loc") if el.text and el.text.strip()}
+        return found
+    except Exception as e:
+        print(f"[aviso] Não foi possível ler o sitemap ({e}) — usando só o urls.txt.")
+        return set()
+
+
+def load_urls():
+    """
+    Lista de páginas monitoradas = urls.txt + tudo que estiver no sitemap.xml.
+    Página nova publicada no site entra no monitoramento sozinha.
+    Retorna (lista_de_urls, set_do_sitemap).
+    """
+    with open(URLS_FILE, encoding="utf-8") as f:
+        manual = [line.strip() for line in f if line.strip()]
+    sitemap = fetch_sitemap_urls()
+    seen = set()
+    urls = []
+    for u in manual + sorted(sitemap):
+        if u not in seen:
+            seen.add(u)
+            urls.append(u)
+    return urls, sitemap
 
 
 def check_page(url):
@@ -187,12 +225,11 @@ def rewrite_incidents(all_rows):
 
 
 def main():
-    with open(URLS_FILE, encoding="utf-8") as f:
-        urls = [line.strip() for line in f if line.strip()]
+    urls, sitemap = load_urls()
 
     now = datetime.datetime.now().isoformat(timespec="seconds")
     print(f"Verificação iniciada: {now}")
-    print(f"Total de páginas: {len(urls)}\n")
+    print(f"Total de páginas: {len(urls)} (sitemap: {len(sitemap)})\n")
 
     confirmed_broken = {}
     response_times = {}
@@ -202,6 +239,13 @@ def main():
         response_times[url] = r["response_ms"]
         if r["ok"]:
             print(f"[ok] {url} ({r['response_ms']} ms)")
+            continue
+
+        # HTTP 410 (Gone) numa página que NÃO está no sitemap = página
+        # removida de propósito do site (ex.: cidades que deixaram de ser
+        # atendidas). Não é incidente — só registra no log.
+        if r["status"] == 410 and sitemap and url not in sitemap:
+            print(f"[removida do site] {url} -> HTTP 410 e fora do sitemap — ignorada.")
             continue
 
         # Primeira falha — espera e confirma antes de tratar como incidente real
