@@ -8,8 +8,12 @@ O que faz em cada execução:
 2. Dentro de cada página, acha o link do botão "Consultar disponibilidade"
    / WhatsApp e confere se ESSE link também funciona (não só a página em si).
 3. Mede o tempo de resposta de cada página.
-4. Se algo falhar, tenta de novo (confirmação dupla) antes de considerar
+4. Se algo falhar, tenta de novo (até 3 checagens) antes de considerar
    incidente de verdade — evita alarme falso por instabilidade passageira.
+   Antes de confirmar uma falha de conexão, testa a internet do próprio
+   servidor do GitHub (sites de controle). Se a internet do GitHub caiu
+   (ex.: "Network is unreachable"), NÃO é problema do site: nada é
+   alertado e incidentes já abertos continuam como estavam.
 5. Se confirmar incidentes novos, registra em data/incidents_week.csv e
    manda UM ÚNICO alerta (WhatsApp + e-mail) com a lista de todas as
    falhas confirmadas nesta execução — nunca um alerta por URL.
@@ -33,6 +37,7 @@ import sys
 import time
 import datetime
 import email.utils
+import socket
 import urllib.request
 import urllib.error
 import xml.etree.ElementTree as ET
@@ -43,7 +48,15 @@ SITEMAP_URL = "https://www.cabinezero15.com.br/sitemap.xml"
 INCIDENTS_FILE = "data/incidents_week.csv"
 THREAD_ID_FILE = "data/thread_id.txt"
 TIMEOUT = 15
-RETRY_WAIT_SECONDS = 20
+# Esperas entre as checagens extras de uma página que falhou (segundos).
+RETRY_WAITS = [20, 60]
+# Endereços de controle: se NENHUM responder, a internet do servidor do
+# GitHub caiu — a falha não é do site.
+CONTROL_URLS = [
+    "https://www.google.com/generate_204",
+    "https://cloudflare.com/cdn-cgi/trace",
+    "https://www.github.com/",
+]
 CTA_PATTERN = re.compile(r'href="(https://www\.cabinezero15\.com\.br/solicitar-orcamento\.html)"')
 
 CALLMEBOT_PHONE = os.environ.get("CALLMEBOT_PHONE", "")
@@ -55,6 +68,34 @@ EMAIL_TO = os.environ.get("EMAIL_TO", "")
 # Assunto fixo (sem data/hora) — ajuda o Gmail a agrupar por thread mesmo
 # quando os cabeçalhos de referência não bastam sozinhos.
 SUBJECT_ALERTA = "Cabine Zero 15 — monitoramento de links"
+
+
+_orig_getaddrinfo = socket.getaddrinfo
+
+
+def _getaddrinfo_ipv4_first(*args, **kwargs):
+    """Tenta IPv4 primeiro: os servidores do GitHub Actions não têm IPv6."""
+    res = _orig_getaddrinfo(*args, **kwargs)
+    return sorted(res, key=lambda r: 0 if r[0] == socket.AF_INET else 1)
+
+
+socket.getaddrinfo = _getaddrinfo_ipv4_first
+
+
+def runner_online():
+    """True se a internet do servidor do GitHub está funcionando."""
+    for u in CONTROL_URLS:
+        try:
+            req = urllib.request.Request(u, headers={"User-Agent": "CabineZero15-LinkMonitor/2.0"})
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+                if resp.status < 500:
+                    return True
+        except urllib.error.HTTPError as e:
+            if e.code < 500:
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def fetch(url):
@@ -225,6 +266,11 @@ def rewrite_incidents(all_rows):
 
 
 def main():
+    if not runner_online():
+        print("[servidor do GitHub sem internet] Nada pode ser verificado agora — "
+              "execução encerrada sem alertas e sem mudar o estado.")
+        return
+
     urls, sitemap = load_urls()
 
     now = datetime.datetime.now().isoformat(timespec="seconds")
@@ -232,6 +278,7 @@ def main():
     print(f"Total de páginas: {len(urls)} (sitemap: {len(sitemap)})\n")
 
     confirmed_broken = {}
+    unknown = set()  # não deu pra verificar (internet do GitHub caiu) — estado mantido
     response_times = {}
 
     for url in urls:
@@ -248,12 +295,22 @@ def main():
             print(f"[removida do site] {url} -> HTTP 410 e fora do sitemap — ignorada.")
             continue
 
-        # Primeira falha — espera e confirma antes de tratar como incidente real
-        print(f"[possível falha] {url} -> {r['reason']} — confirmando de novo em {RETRY_WAIT_SECONDS}s...")
-        time.sleep(RETRY_WAIT_SECONDS)
-        r2 = check_page(url)
+        # Falhou — confirma com mais checagens antes de tratar como incidente real
+        r2 = r
+        for wait in RETRY_WAITS:
+            print(f"[possível falha] {url} -> {r2['reason']} — confirmando de novo em {wait}s...")
+            time.sleep(wait)
+            r2 = check_page(url)
+            if r2["ok"]:
+                break
         if r2["ok"]:
-            print(f"[falso alarme] {url} voltou ao normal na segunda checagem.")
+            print(f"[falso alarme] {url} voltou ao normal na checagem extra.")
+            continue
+
+        # Falha de conexão: antes de culpar o site, confere a internet do GitHub
+        if r2["status"] is None and not runner_online():
+            print(f"[servidor do GitHub sem internet] {url} não pôde ser verificada — sem alerta.")
+            unknown.add(url)
             continue
 
         print(f"[confirmado] {url} -> {r2['reason']}")
@@ -270,7 +327,7 @@ def main():
     # --- Junta tudo que foi resolvido nesta execução (não notifica ainda) ---
     newly_resolved = []
     for row in all_rows:
-        if row.get("resolved_at", "") == "" and row["url"] not in confirmed_broken:
+        if row.get("resolved_at", "") == "" and row["url"] not in confirmed_broken and row["url"] not in unknown:
             row["resolved_at"] = now
             newly_resolved.append(row["url"])
 
@@ -307,7 +364,8 @@ def main():
         notify_batch(SUBJECT_ALERTA, whatsapp_text, email_text)
 
     total_broken_now = len(confirmed_broken)
-    print(f"\nResumo: {len(urls) - total_broken_now}/{len(urls)} páginas OK.")
+    extra = f" ({len(unknown)} não verificada(s) por queda de internet do GitHub)" if unknown else ""
+    print(f"\nResumo: {len(urls) - total_broken_now - len(unknown)}/{len(urls)} páginas OK{extra}.")
 
     if total_broken_now:
         sys.exit(1)
